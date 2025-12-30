@@ -82,6 +82,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # 转换为半精度保存，节省空间    
             state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
             torch.save(state_dict, ckp)
+            Logger(f"--- Saved checkpoint at step {step} to {ckp} ---")
             # 保存训练状态（含优化器、scaler等，用于恢复训练）
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
