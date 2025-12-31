@@ -1,6 +1,7 @@
 import os
 import sys
 
+# 设置包路径，确保能导入 model 和 dataset 模块
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -26,6 +27,7 @@ warnings.filterwarnings('ignore')
 
 
 # 自定义的Critic模型，继承自MiniMindLM
+# 作用：预测一个状态（文本序列）的预期总奖励，用于计算 Advantage（优势）
 class CriticModel(MiniMindForCausalLM):
     def __init__(self, params):
         super().__init__(params)
@@ -36,15 +38,18 @@ class CriticModel(MiniMindForCausalLM):
         # 使用基础模型获取隐藏状态
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         hidden_states = self.model.norm(outputs[0])
-        # 使用value_head获取价值估计
+        # 使用value_head获取价值估计，将隐藏层向量映射为单一的价值得分
         values = self.value_head(hidden_states).squeeze(-1)
         return values
 
 
 def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
-    """整合所有奖励函数计算总奖励"""
+    """
+    整合所有奖励函数计算总奖励
+    推理模型专用奖励：鼓励模型使用 <think> 和 <answer> 标签
+    """
     def reasoning_model_reward(rewards):
-        # 1. 格式奖励（仅针对训练推理模型时使用）
+        # 1. 格式奖励（仅针对训练推理模型时使用）检查回答是否严格符合特定的 XML 结构
         pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
         pattern2 = r"^<think>\n.*?\n</think>\n\n<answer>\n.*?\n</answer>$"
 
@@ -54,7 +59,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
         format_rewards = []
         for match_pattern, match_pattern2 in zip(matches_pattern, matches_pattern2):
             if match_pattern:
-                format_rewards.append(0.5)
+                format_rewards.append(0.5) # 格式正确加 0.5 分
             elif match_pattern2:
                 format_rewards.append(0.5)
             else:
@@ -64,6 +69,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
         # 2. 标记奖励（防止严格奖励稀疏，仅针对训练推理模型时使用）
         def mark_num(text):
             reward = 0
+            # 每个标签出现且仅出现一次加 0.25
             if text.count("<think>") == 1:
                 reward += 0.25
             if text.count("</think>") == 1:
@@ -80,24 +86,28 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
     rewards = torch.zeros(len(responses), device=args.device)
 
-    # 格式奖励
+    # 格式奖励，如果是推理模型训练，增加规则奖励
     if args.reasoning == 1:
         rewards = reasoning_model_reward(rewards)
 
-    # 使用reward model计算整个response的奖励
+    # 使用外部 Reward Model (如 InternLM2-Reward) 计算内容质量分
     with torch.no_grad():
         reward_model_scores = []
         for prompt, response in zip(prompts, responses):
+            # 这里的正则用于解析 ChatML 格式，提取对话历史
             pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
             matches = re.findall(pattern, prompt, re.DOTALL)
             messages = [{"role": role, "content": content.strip()} for role, content in matches]
 
+            # 拼入模型当前的回答，送入奖励模型打分
             tmp_chat = messages + [{"role": "assistant", "content": response}]
             score = reward_model.get_score(reward_tokenizer, tmp_chat)
 
+            # 限制评分范围 (Clipping)
             scale = 3.0
             score = max(min(score, scale), -scale)
 
+            # 推理模型特殊处理：如果存在 <answer> 标签，重点对答案内容打分
             # 当args.reasoning=1时，额外计算<answer>内容的奖励
             if args.reasoning == 1:
                 answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
@@ -107,6 +117,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
                     tmp_chat = messages + [{"role": "assistant", "content": answer_content}]
                     answer_score = reward_model.get_score(reward_tokenizer, tmp_chat)
                     answer_score = max(min(answer_score, scale), -scale)
+                    # 综合评分：40% 整体表现 + 60% 最终答案质量
                     score = score * 0.4 + answer_score * 0.6
             reward_model_scores.append(score)
 
@@ -115,61 +126,85 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
     return rewards
 
-
+# PPO 训练主循环，涉及 4 个模型：Actor (训练中), Old Actor (采样), Ref (KL惩罚), Critic (估值)
 def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, start_step=0, wandb=None):
     actor_model.train()
     critic_model.train()
 
     for step, batch in enumerate(loader, start=start_step + 1):
+        # 1. 编码 Prompt
         prompts = batch["prompt"]  # list[str], length B
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, 
                        max_length=args.max_seq_len).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
         prompt_lengths = enc.attention_mask.sum(dim=1)  # [B]
 
+        # 2. 采样阶段 (Experience Collection)
         with torch.no_grad():
             # DDP 模型需要使用 .module 访问 generate 方法
             model_for_gen = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
+            # Actor 根据 Prompt 生成回答
             gen_out = model_for_gen.generate(
                 input_ids=enc.input_ids, attention_mask=enc.attention_mask,
                 max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]
 
+        # 3. 计算奖励
         responses_text = [tokenizer.decode(gen_out[i, prompt_lengths[i]:], skip_special_tokens=True) for i in range(len(prompts))]
         rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]
 
+        # 4. 计算 Advantage (优势)
+        # full_mask 标记有效 token（prompt + response）
         full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
         values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
+        # 仅取出序列中最后一个有效 token 的价值预测作为 V(s)
         last_indices = full_mask.sum(dim=1) - 1  # [B]
         values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]
+        # Advantage = R - V(s) (反映该回答是否好于预期)
         advantages = rewards - values.detach()  # [B]
 
-        logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
+        # 5. 计算训练指标 (Log Probability)
+        logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, Vocab]
+         # labels 是下一个 token（标准 LM shift）
         labels = gen_out[:, 1:].clone()  # [B, P+R-1]
+        # 计算每个 token 的 log probability
         logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
+        # 仅针对生成（回答）部分计算 mask，排除 Prompt 和 Padding
         seq_len = gen_out.size(1) - 1
         resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_lengths.unsqueeze(1)
+        # 同时排除 padding
         final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1]
+        # 对 response token 的 logp 求和（序列级 logπθ(a|s)）
         actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B]
 
+        # 6. Old policy & Reference policy 的 log-prob
         with torch.no_grad():
+            # π_old
             old_logits = old_actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
             old_logp_tokens = F.log_softmax(old_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
             old_logp = (old_logp_tokens * final_mask).sum(dim=1)  # [B]
-            
+            # π_ref（KL 约束用)
             ref_logits = ref_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
             ref_logp_tokens = F.log_softmax(ref_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
             ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B]
 
+        # 7. PPO Loss 构造
+        # KL(πθ || π_old)，用于监控（非 loss 主项）
         kl = (actor_logp - old_logp).mean()  # scalar
+        # KL(πθ || π_ref)，作为正则项
         kl_ref = (actor_logp - ref_logp).mean()  # scalar
+        # PPO ratio
         ratio = torch.exp(actor_logp - old_logp)  # [B]
+        # PPO clip surrogate
         surr1 = ratio * advantages  # [B]
         surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages  # [B]
+        # Actor loss（负号是最小化)
         policy_loss = -torch.min(surr1, surr2).mean()  # scalar
+        # Critic loss
         value_loss = F.mse_loss(values, rewards)  # scalar
         loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
         loss.backward()
 
+        # 8. 梯度累积 & 参数更新
         if (step + 1) % args.accumulation_steps == 0:
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)
             clip_grad_norm_(critic_model.parameters(), args.grad_clip)
@@ -181,6 +216,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             critic_optimizer.zero_grad()
             torch.cuda.empty_cache()
 
+        # 9. 日志与监控（主进程）
         if is_main_process():
             response_ids = gen_out[:, enc.input_ids.shape[1]:]
             is_eos = (response_ids == tokenizer.eos_token_id)
@@ -213,7 +249,8 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                    f"Actor Loss: {actor_loss_val:.6f}, Critic Loss: {critic_loss_val:.6f}, "
                    f"Reward: {reward_val:.6f}, KL: {kl_val:.6f}, KL_ref: {kl_ref_val:.6f}, "
                    f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.2e}, Critic LR: {critic_lr:.2e}")
-
+        
+        # 10. 同步 old_actor（PPO 关键步骤）
         if (step + 1) % args.update_old_actor_freq == 0:
             state_dict = actor_model.module.state_dict() if isinstance(actor_model, DistributedDataParallel) else actor_model.state_dict()
             old_actor_model.load_state_dict({k: v.detach().cpu() for k, v in state_dict.items()})
