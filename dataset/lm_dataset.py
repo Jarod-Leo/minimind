@@ -18,13 +18,14 @@ class PretrainDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = self.load_data(data_path)
+        self.samples = self.load_data(data_path) # 样本数据
 
     def load_data(self, path):
+        """加载 JSONL 格式的原始文本数据"""
         samples = []
         with open(path, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
-                data = json.loads(line.strip())
+                data = json.loads(line.strip()) # 需要一行行加载
                 samples.append(data)
         return samples
 
@@ -35,6 +36,7 @@ class PretrainDataset(Dataset):
         sample = self.samples[index]
 
         # 构建输入文本
+        # 将纯文本转化为Token ID
         encoding = self.tokenizer(
             str(sample['text']),
             max_length=self.max_length,
@@ -43,8 +45,11 @@ class PretrainDataset(Dataset):
             return_tensors='pt'
         )
         input_ids = encoding.input_ids.squeeze()
+        # loss_mask: 只有非填充（Padding）的部分才计算损失
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
-
+        # 构建因果语言建模任务：
+        # X: [0, 1, 2, 3] -> 输入序列
+        # Y: [1, 2, 3, 4] -> 预测目标（错开一位）
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
@@ -57,6 +62,7 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = self.load_data(jsonl_path)
+        # 预先编码标识符，用于定位答案的起始和结束位置
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
 
@@ -67,11 +73,12 @@ class SFTDataset(Dataset):
         samples = []
         with open(path, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
-                data = json.loads(line.strip())
+                data = json.loads(line.strip()) # 加载去掉前后空格的json数据
                 samples.append(data)
         return samples
 
     def _create_chat_prompt(self, cs):
+        """调用分词器的模板功能，将对话列表转为带角色标识的字符串"""
         messages = cs.copy()
         tools = cs[0]["functions"] if (cs and cs[0]["role"] == "system" and cs[0].get("functions")) else None
         return self.tokenizer.apply_chat_template(
@@ -82,16 +89,24 @@ class SFTDataset(Dataset):
         )
 
     def _generate_loss_mask(self, input_ids):
+        """
+        动态 Loss 掩码生成：
+        核心逻辑：模型只需要学习『如何回答』，不需要学习『用户问了什么』。
+        因此只有在 'assistant' 标识之后到 'eos_token' 之前的部分 mask 为 1。
+        """
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
+            # 匹配到助手回答的开始
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
                 start = i + len(self.bos_id)
                 end = start
                 while end < len(input_ids):
+                    # 匹配到回答结束
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
+                # 将答案区间内的 Token 设为需要计算 Loss (1)    
                 for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
                     loss_mask[j] = 1
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
@@ -104,6 +119,7 @@ class SFTDataset(Dataset):
         # 构建对话提示
         prompt = self._create_chat_prompt(sample['conversations'])
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        # 手动 Padding
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
 
         # 生成动态损失掩码
@@ -144,8 +160,10 @@ class DPODataset(Dataset):
 
     def __getitem__(self, index):
         item = self.data[index]
+        # DPO 数据包含：被选中的（chosen）和被拒绝的（rejected）两个序列
         chosen = item['chosen']  # 是一个 list，里面包含若干 {role, content}
         rejected = item['rejected']  # 同上
+        # 分别处理两个序列，流程同 SFT
         chosen_prompt = self.tokenizer.apply_chat_template(
             chosen, tokenize=False, add_generation_prompt=False
         )
@@ -171,7 +189,7 @@ class DPODataset(Dataset):
         x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
         mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
-
+        # DPO 需要同时返回选中的序列和拒绝的序列，以便后续计算隐含的奖励差值
         return {
             'x_chosen': x_chosen,
             'y_chosen': y_chosen,
@@ -182,6 +200,7 @@ class DPODataset(Dataset):
         }
 
     def _generate_loss_mask(self, input_ids):
+        # 逻辑与 SFT 相同，确保只计算模型生成部分的概率
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
@@ -199,7 +218,7 @@ class DPODataset(Dataset):
                 i += 1
         return loss_mask
 
-
+# 目标：只返回提示词（Prompt），用于模型自生成答案，再通过 AI 打分进行强化
 class RLAIFDataset(Dataset):
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
@@ -229,6 +248,7 @@ class RLAIFDataset(Dataset):
             messages.append({"role": role, "content": turn['content']})
             answer = turn['content']
         return self.tokenizer.apply_chat_template(
+            # messages[:-1] 表示只取到用户最后一次提问，不包含助手的回答
             messages[:-1],
             tokenize=False,
             add_generation_prompt=True  # 这里需要True
@@ -240,8 +260,8 @@ class RLAIFDataset(Dataset):
         prompt, answer = self._create_chat_prompt(sample['conversations'])
 
         return {
-            'prompt': prompt,
-            'answer': answer
+            'prompt': prompt, # 模型需要补全的开头
+            'answer': answer # 原始的正确答案（用于计算奖励或对比)
         }
 
 
