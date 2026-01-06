@@ -133,75 +133,85 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
 
     for step, batch in enumerate(loader, start=start_step + 1):
         # 1. 编码 Prompt
-        prompts = batch["prompt"]  # list[str], length B
-        enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, 
-                       max_length=args.max_seq_len).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
-        prompt_lengths = enc.attention_mask.sum(dim=1)  # [B]
+        prompts = batch["prompt"]
+        enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=args.max_seq_len).to(args.device)
+        prompt_lengths = enc.attention_mask.sum(dim=1) # [B]
 
         # 2. 采样阶段 (Experience Collection)
         with torch.no_grad():
-            # DDP 模型需要使用 .module 访问 generate 方法
             model_for_gen = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
-            # Actor 根据 Prompt 生成回答
             gen_out = model_for_gen.generate(
                 input_ids=enc.input_ids, attention_mask=enc.attention_mask,
                 max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
-                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]
+                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+        
+        B, total_len = gen_out.shape
+        full_mask = (gen_out != tokenizer.pad_token_id).long() # [B, L](L = P + R_actual)
 
-        # 3. 计算奖励
-        responses_text = [tokenizer.decode(gen_out[i, prompt_lengths[i]:], skip_special_tokens=True) for i in range(len(prompts))]
-        rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]
+        # 3. 计算所有模型的 Log-probs
+        # labels 是生成序列的后移一位
+        labels = gen_out[:, 1:].clone() # [B, L-1]
+        
+        # 计算当前 Actor, Old Actor, Reference 的 Log-probs
+        def get_logp(model, ids, mask):
+            logits = model(input_ids=ids, attention_mask=mask).logits[:, :-1, :]
+            return F.log_softmax(logits, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)
 
-        # 4. 计算 Advantage (优势)
-        # full_mask 标记有效 token（prompt + response）
-        full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
-        values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
-        # 仅取出序列中最后一个有效 token 的价值预测作为 V(s)
-        last_indices = full_mask.sum(dim=1) - 1  # [B]
-        values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]
-        # Advantage = R - V(s) (反映该回答是否好于预期)
-        advantages = rewards - values.detach()  # [B]
-
-        # 5. 计算训练指标 (Log Probability)
-        logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, Vocab]
-         # labels 是下一个 token（标准 LM shift）
-        labels = gen_out[:, 1:].clone()  # [B, P+R-1]
-        # 计算每个 token 的 log probability
-        logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
-        # 仅针对生成（回答）部分计算 mask，排除 Prompt 和 Padding
-        seq_len = gen_out.size(1) - 1
-        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_lengths.unsqueeze(1)
-        # 同时排除 padding
-        final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1]
-        # 对 response token 的 logp 求和（序列级 logπθ(a|s)）
-        actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B]
-
-        # 6. Old policy & Reference policy 的 log-prob
+        logp_tokens = get_logp(actor_model, gen_out, full_mask) # [B, L-1]
         with torch.no_grad():
-            # π_old
-            old_logits = old_actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
-            old_logp_tokens = F.log_softmax(old_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
-            old_logp = (old_logp_tokens * final_mask).sum(dim=1)  # [B]
-            # π_ref（KL 约束用)
-            ref_logits = ref_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
-            ref_logp_tokens = F.log_softmax(ref_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
-            ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B]
+            old_logp_tokens = get_logp(old_actor_model, gen_out, full_mask) # [B, L-1]
+            ref_logp_tokens = get_logp(ref_model, gen_out, full_mask) # [B, L-1]
+            # 计算 RM 奖励 (Sequence-level)
+            responses_text = [tokenizer.decode(gen_out[i, prompt_lengths[i]:], skip_special_tokens=True) for i in range(B)]
+            rm_rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer) # [B]
 
-        # 7. PPO Loss 构造
-        # KL(πθ || π_old)，用于监控（非 loss 主项）
-        kl = (actor_logp - old_logp).mean()  # scalar
-        # KL(πθ || π_ref)，作为正则项
-        kl_ref = (actor_logp - ref_logp).mean()  # scalar
-        # PPO ratio
-        ratio = torch.exp(actor_logp - old_logp)  # [B]
-        # PPO clip surrogate
-        surr1 = ratio * advantages  # [B]
-        surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages  # [B]
-        # Actor loss（负号是最小化)
-        policy_loss = -torch.min(surr1, surr2).mean()  # scalar
-        # Critic loss
-        value_loss = F.mse_loss(values, rewards)  # scalar
-        loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
+        # 4. 奖励塑形 (Reward Shaping) - Token-level
+        # 构造每一个 token 的奖励：即时奖励 = KL 惩罚
+        kl_penalty = -args.kl_coef * (logp_tokens.detach() - ref_logp_tokens) # [B, L-1]
+        
+        # 定义 Response Mask (仅在回答部分计算)
+        seq_len_m1 = total_len - 1 #[L-1]
+        resp_mask = torch.arange(seq_len_m1, device=args.device).unsqueeze(0) >= (prompt_lengths.unsqueeze(1) - 1) # [1, L-1]
+        final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id)) # [B, L-1]
+
+        step_rewards = kl_penalty * final_mask # [B, L-1]
+        # 将 RM 奖励加在最后一个有效 token 上
+        last_token_indices = final_mask.sum(dim=1) + prompt_lengths - 2 # [B]
+        for i in range(B):
+            step_rewards[i, last_token_indices[i]] += rm_rewards[i]
+
+        # 5. 计算 Advantage (GAE)
+        values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask) # [B, L]
+        # 对齐索引：values_seq[:, t] 是在看到 token t 之前的预估值，用来预测 token t+1 的收益
+        v_preds = values_seq[:, :-1] # [B, L-1]
+        
+        advantages = torch.zeros_like(step_rewards) # [B, L-1]
+        last_gae_lam = 0
+        gamma = args.gamma
+        lam = args.gae_lambda
+
+        # 逆向 GAE 计算
+        for t in reversed(range(seq_len_m1)):
+            next_v = values_seq[:, t+1] if t < seq_len_m1 - 1 else 0
+            delta = step_rewards[:, t] + gamma * next_v - values_seq[:, t]
+            advantages[:, t] = last_gae_lam = delta + gamma * lam * last_gae_lam
+        
+        returns = advantages + v_preds # [B, L-1]
+        # Advantage 标准化 (重要：稳定训练)
+        advantages = (advantages - advantages[final_mask].mean()) / (advantages[final_mask].std() + 1e-8)
+
+        # 6. PPO Loss 构造 (Token-level)
+        ratio = torch.exp(logp_tokens - old_logp_tokens)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages
+        
+        # 只在 response 区域计算损失
+        policy_loss = - (torch.min(surr1, surr2) * final_mask).sum() / final_mask.sum()
+        # Value loss (Critic 拟合 returns)
+        value_loss = ((v_preds - returns.detach())**2 * final_mask).sum() / final_mask.sum()
+        
+        # 综合 Loss
+        loss = policy_loss + args.vf_coef * value_loss
         loss.backward()
 
         # 8. 梯度累积 & 参数更新
@@ -295,6 +305,8 @@ if __name__ == "__main__":
     parser.add_argument("--clip_epsilon", type=float, default=0.1, help="PPO裁剪参数")
     parser.add_argument("--vf_coef", type=float, default=0.5, help="Value function系数")
     parser.add_argument("--kl_coef", type=float, default=0.02, help="KL散度惩罚系数")
+    parser.add_argument("--gamma", type=float, default=0.99, help="折扣因子 (Discount Factor)")
+    parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE 平滑因子")
     parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1], help='推理模型类型（0=普通模型，1=推理模型）')
     parser.add_argument("--update_old_actor_freq", type=int, default=4, help="更新old_actor_model的频率")
     parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")
