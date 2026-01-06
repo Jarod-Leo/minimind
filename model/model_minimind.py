@@ -206,7 +206,7 @@ class Attention(nn.Module):
         # 4. 执行注意力计算 (Flash Attention 或 手写 Softmax)
         # 5. 输出投影
         bsz, seq_len, _ = x.shape
-        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x) shape: [B, S, N_h * D_h]
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x) # shape: [B, S, N_h * D_h]
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim) # shape:[B, S, N_h, D_h]
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim) # shape: [B, S, N_kv, D_h]
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim) # shape: [B, S, N_kv, D_h]
