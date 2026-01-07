@@ -524,15 +524,28 @@ class MiniMindModel(nn.Module):
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
-    """用于因果语言建模的包装类（输出 Logits）。"""
+    """
+    MiniMind 因果语言模型包装类。
+    继承 PreTrainedModel 以兼容 HuggingFace 权重的加载/保存，
+    继承 GenerationMixin 以获得 .generate() 文本生成能力。
+    """
     config_class = MiniMindConfig
 
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
+        
+        # 1. 实例化底层的 Transformer 主体模型 (Decoder 结构)
         self.model = MiniMindModel(self.config)
+        
+        # 2. 定义语言模型头：将隐藏层维度 (H) 映射到词表大小 (V)，用于预测下一个 Token
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        
+        # 3. 权重共享 (Weight Tying)：将词嵌入层和输出头的权重绑定。
+        # 这样做可以减少参数量，且在小模型上通常能提高训练稳定性
         self.model.embed_tokens.weight = self.lm_head.weight
+        
+        # 4. 初始化标准输出容器
         self.OUT = CausalLMOutputWithPast()
 
     def forward(self,
@@ -542,6 +555,8 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
+        # A. 将输入传入主体模型，获取最后一层的隐藏状态
+        # h: [BatchSize, SeqLen, HiddenSize]        
         h, past_kvs, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -549,8 +564,16 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         ) # h: [B, S, H]
+
+        # B. 处理 Logits 计算切片。
+        # 在训练时，通常需要计算整个序列的 Logits；但在生成时，有时只需计算最后一个 Token 的 Logits。
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        
+        # C. 线性投影：从隐藏状态转换到词表概率空间 (Logits)
+        # logits 形状: [BatchSize, 切片长度, VocabSize]
         logits = self.lm_head(h[:, slice_indices, :]) # [B, S', V]
+        
+        # D. 封装输出结果，支持对象属性访问
         self.OUT.__setitem__('last_hidden_state', h)
         self.OUT.__setitem__('logits', logits)
         self.OUT.__setitem__('aux_loss', aux_loss)
