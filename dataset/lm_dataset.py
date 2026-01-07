@@ -18,7 +18,7 @@ class PretrainDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = self.load_data(data_path) # 样本数据
+        self.samples = self.load_data(data_path) # 样本数据, 写到__init__中被dataloader加载时会自动调用， 加载数据到内存
 
     def load_data(self, path):
         """加载 JSONL 格式的原始文本数据"""
@@ -30,9 +30,11 @@ class PretrainDataset(Dataset):
         return samples
 
     def __len__(self):
+        """DataLoader 需要知道总共有多少数据，以此来计算总共有多少个 Batch。"""
         return len(self.samples)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index): 
+        """DataLoader 内部的采样器会产生一系列索引，然后不断调用此方法来获取单个样本。"""
         sample = self.samples[index]
 
         # 构建输入文本
@@ -46,13 +48,14 @@ class PretrainDataset(Dataset):
         )
         input_ids = encoding.input_ids.squeeze()
         # loss_mask: 只有非填充（Padding）的部分才计算损失
-        loss_mask = (input_ids != self.tokenizer.pad_token_id)
+        loss_mask = (input_ids != self.tokenizer.pad_token_id)# shape: [seq_len]
         # 构建因果语言建模任务：
         # X: [0, 1, 2, 3] -> 输入序列
         # Y: [1, 2, 3, 4] -> 预测目标（错开一位）
-        X = torch.tensor(input_ids[:-1], dtype=torch.long)
-        Y = torch.tensor(input_ids[1:], dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        X = torch.tensor(input_ids[:-1], dtype=torch.long) # shape: [seq_len - 1]
+        Y = torch.tensor(input_ids[1:], dtype=torch.long) # shape: [seq_len - 1]
+        # 损失掩码也要相应错开一位，因为 Y 的第一个 token 对应的是原始序列的第 2 个位置,要与Y贴合
+        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long) # shape: [seq_len - 1]
         return X, Y, loss_mask
 
 
@@ -63,7 +66,9 @@ class SFTDataset(Dataset):
         self.max_length = max_length
         self.samples = self.load_data(jsonl_path)
         # 预先编码标识符，用于定位答案的起始和结束位置
+        # bos_token <im_start>
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
+        # eos_token <im_ends>
         self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
 
     def __len__(self):
@@ -97,29 +102,36 @@ class SFTDataset(Dataset):
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
-            # 匹配到助手回答的开始
+            # # 检查当前位置是否匹配 assistant 开始标识（self.bos_id，通常是 ["<|assistant|>", "\n"] 等 token 序列）
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                # 记录 assistant 内容起始位置（bos_id 之后）
                 start = i + len(self.bos_id)
                 end = start
+                # 从 start 开始向后搜索 eos_id（assistant 结束标识）
                 while end < len(input_ids):
                     # 匹配到回答结束
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
-                # 将答案区间内的 Token 设为需要计算 Loss (1)    
+                # 将 assistant 回答内容区域（不包括 bos_id，但包括 eos_id 之前的 token）设为 1
+                # +1 是为了跳过 bos_id 后的第一个 token（有时是换行），根据实际数据调整
+                # min 防止越界，self.max_length 是序列最大长度限制   
                 for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
                     loss_mask[j] = 1
+                # 跳到当前 assistant 块结束位置，继续查找下一个（支持多轮对话）
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
+                # 未匹配 bos_id，继续向前搜索
                 i += 1
+        # 返回长度为 seq_len 的 list，值 0 表示忽略损失，1 表示参与损失计算
         return loss_mask
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        # 构建对话提示
+        # 构建对话提示（包含prompt和answer）
         prompt = self._create_chat_prompt(sample['conversations'])
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
-        # 手动 Padding
+        # 手动 Padding, 右padding
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
 
         # 生成动态损失掩码
@@ -183,9 +195,11 @@ class DPODataset(Dataset):
 
         rejected_input_ids = rejected_encoding['input_ids']
         rejected_loss_mask = self._generate_loss_mask(rejected_input_ids)
+
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
+
         x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
         mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
@@ -205,14 +219,14 @@ class DPODataset(Dataset):
         i = 0
         while i < len(input_ids):
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id)
+                start = i + len(self.bos_id) 
                 end = start
                 while end < len(input_ids):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
                 for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
-                    loss_mask[j] = 1
+                    loss_mask[j] = 1 # 与labels对齐
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
                 i += 1
