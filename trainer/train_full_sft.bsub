@@ -1,0 +1,79 @@
+#!/bin/bash
+#BSUB -J minimind_sft2048_ppo            # 任务名合并
+#BSUB -o ../logs/sft2048_ppo.%J.out      # 标准输出
+#BSUB -e ../logs/sft2048_ppo.%J.err      # 错误输出
+#BSUB -q gpu_regular                  # 队列名
+#BSUB -W 72:00                        # 时间限制建议增加（SFT+PPO的总时间）
+#BSUB -n 32                           # 申请 32 个 CPU 核心
+#BSUB -gpu "num=8:mode=exclusive_process:j_exclusive=yes" # 申请 8 张 GPU
+#BSUB -M 8192                         # 内存设置
+#BSUB -R "span[hosts=1]"
+# --- 1. 环境准备 ---
+module load conda/4.11.0 
+source activate minimind 
+
+echo "------------------------------------------------"
+echo "Pipeline started on: $(date)"
+echo "Host: $(hostname)"
+echo "------------------------------------------------"
+
+export OMP_NUM_THREADS=1
+export MASTER_ADDR=$(hostname)
+export MASTER_PORT=$(shuf -i 10000-60000 -n 1)
+
+# --- 2. 运行 SFT 任务 ---
+echo ">>> Step 1: Starting Supervised Fine-Tuning (SFT)..."
+torchrun \
+    --nproc_per_node=8 \
+    --master_addr $MASTER_ADDR \
+    --master_port $MASTER_PORT \
+    train_full_sft.py \
+    --batch_size 4 \
+    --accumulation_steps 4 \
+    --num_workers 4 \
+    --hidden_size 768 \
+    --num_hidden_layers 16 \
+    --max_seq_len 2048 \
+    --from_weight full_sft \
+    --data_path ../dataset/sft_2048.jsonl \
+    --use_wandb
+
+# 获取 SFT 的退出状态码
+sft_status=$?
+
+if [ $sft_status -eq 0 ]; then
+    echo "------------------------------------------------"
+    echo "SFT Task completed successfully at: $(date)"
+    echo ">>> Step 2: Starting PPO Training..."
+    echo "------------------------------------------------"
+
+    # 为了安全起见，PPO 重新生成一个端口，防止连接挂起
+    export MASTER_PORT=$(shuf -i 10000-60000 -n 1)
+
+    torchrun \
+        --nproc_per_node=8 \
+        --master_addr $MASTER_ADDR \
+        --master_port $MASTER_PORT \
+        train_full_sft.py \
+        --batch_size 4 \
+        --accumulation_steps 1 \
+        --num_workers 4 \
+        --hidden_size 768 \
+        --num_hidden_layers 16 \
+        --reasoning 0 \
+        --use_wandb
+
+    ppo_status=$?
+    if [ $ppo_status -eq 0 ]; then
+        echo "All tasks in pipeline completed successfully!"
+    else
+        echo "PPO Task failed with exit code $ppo_status"
+        exit $ppo_status
+    fi
+else
+    echo "------------------------------------------------"
+    echo "SFT Task failed with exit code $sft_status."
+    echo "PPO Task will not be executed."
+    echo "------------------------------------------------"
+    exit $sft_status
+fi

@@ -1,0 +1,58 @@
+#!/bin/bash
+#BSUB -J sft_minimind          # 任务名
+#BSUB -o ../logs/sft.%J.out     # 标准输出 (需确保 logs 文件夹存在)
+#BSUB -e ../logs/sft.%J.err     # 错误输出
+#BSUB -q gpu_regular              # 队列名
+#BSUB -W 48:00                    # 运行时间限制
+#BSUB -n 32                        # 【修改建议】申请 24 个 CPU 核心 (通常 1 个 GPU 配 4 个 CPU 核心数据加载更快)
+#BSUB -gpu "num=8:mode=exclusive_process:j_exclusive=yes" # 申请 4 张 GPU，独占模式
+#BSUB -M 8192       # 【修改建议】申请 32G 内存 (16G 对于双卡 Transformer 可能容易 OOM)
+#BSUB -R "span[hosts=1]"          # 【关键修正】强制所有资源分配在同一个节点 (单机多卡)
+
+
+# --- 1. 环境准备 ---
+# 加载集群的基础 conda 模块 (参考你的示例)
+module load conda/4.11.0 
+
+# 激活你的虚拟环境
+# 注意：有些集群需要 source activate，有些是 conda activate，根据你的实际情况
+source activate minimind 
+
+# --- 2. 网络通讯设置 (DDP) ---
+echo "------------------------------------------------"
+echo "Job started on: $(date)"
+echo "Host: $(hostname)"
+echo "Current working directory: $(pwd)"
+echo "------------------------------------------------"
+
+export OMP_NUM_THREADS=1
+# 获取主节点 IP (对于单机多卡，这就是本机)
+export MASTER_ADDR=$(hostname)
+# 生成一个随机端口，避免和别人冲突 (比固定的 29500 更安全)
+export MASTER_PORT=$(shuf -i 10000-60000 -n 1)
+
+echo "Master Addr: $MASTER_ADDR"
+echo "Master Port: $MASTER_PORT"
+
+# 调试设置 (如果训练卡住不动，取消下面这行的注释)
+# export NCCL_DEBUG=INFO
+
+# --- 3. 运行训练命令 ---
+# 说明：
+# --nproc_per_node=2 : 对应申请的 GPU 数量 (num=2)
+# 使用 python -m torch.distributed.launch 启动分布式训练
+echo "--- Starting Task: PPO Train ---"
+torchrun \
+    --nproc_per_node=8 \
+    --master_addr $MASTER_ADDR \
+    --master_port $MASTER_PORT \
+    train_full_sft.py \
+    --batch_size 16 \
+    --accumulation_steps 1 \
+    --num_workers 4 \
+    --hidden_size 768 \
+    --num_hidden_layers 16 \
+    --from_weight pretrain \
+    --data_path  ../dataset/sft_2048.jsonl \
+    --use_wandb 
+      
