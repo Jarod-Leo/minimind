@@ -243,7 +243,7 @@ class Attention(nn.Module):
                 diagonal=1
             ).unsqueeze(0).unsqueeze(0)  # scores+mask
 
-            if attention_mask is not None:
+            if attention_mask is not None: # 如果输入中有 Padding，将 attention_mask 转换为“加性掩码”（0/False 变为 $-1e9$），进一步加到 scores 上。
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
