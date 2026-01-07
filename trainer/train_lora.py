@@ -24,39 +24,49 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1): # 加载一个batcg的数据
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate) # 学习率调度器
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        with autocast_ctx:
-            res = model(X)
+        with autocast_ctx: # 混合精度上下文管理器（智能降精度加速器）
+            res = model(X) # res.logits 形状: [Batch_Size, Seq_Len, Vocab_Size]
             loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),
-                Y.view(-1)
-            ).view(Y.size())
+                res.logits.view(-1, res.logits.size(-1)), # view(-1, size(-1)) 后预测值变为: [B*S, V]
+                Y.view(-1) # view(-1) 后标签变为: [B*S]
+            ).view(Y.size()) # 计算后还原回 [B, S] 形状，每个位置是一个 loss 值
 
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
+            # 3. 掩码处理：只计算非 Padding 部分的平均 Loss
+            # loss * loss_mask: 对应位置相乘，掩码为0的地方 loss 变为 0
+            loss = (loss * loss_mask).sum() / loss_mask.sum() 
+            # 4. 加上 MoE 架构特有的负载均衡损失 (辅助损失)s
             loss += res.aux_loss
+            # 5. 梯度累积：将 loss 除以累积步数
             loss = loss / args.accumulation_steps
-
+        # 反向传播：缩放 loss 并计算梯度，反向传播得到的梯度也同步放大了 $S$ 倍
         scaler.scale(loss).backward()
 
+        # 当达到设定的梯度累积步数时，更新权重
         if (step + 1) % args.accumulation_steps == 0:
+            # 反缩放梯度，还原回原始梯度，用于梯度裁剪
             scaler.unscale_(optimizer)
+            # 梯度裁剪：防止梯度爆炸，只裁剪训练的参数（如 LoRA 参数）
             torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
 
+            # 步进更新优化器和缩放器
             scaler.step(optimizer)
             scaler.update()
-
+            # 清空梯度，set_to_none=True 比 zero_ 略快且节省显存
             optimizer.zero_grad(set_to_none=True)
+            # 及时释放不再使用的缓存
             torch.cuda.empty_cache()
 
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
+            # 还原真实的当前 Loss 用于显示
             current_loss = loss.item() * args.accumulation_steps
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
@@ -68,7 +78,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
             lora_save_path = f'{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}.pth'
-            # LoRA只保存LoRA权重
+            # LoRA 模式下：只提取并保存额外的 adapter 权重，不保存庞大的底座模型
             save_lora(model, lora_save_path)
             lm_checkpoint(lm_config, weight=args.lora_name, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
