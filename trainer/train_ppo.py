@@ -146,6 +146,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
         
         B, total_len = gen_out.shape
+        # full_mask是对填充部分padding的掩码
         full_mask = (gen_out != tokenizer.pad_token_id).long() # [B, L](L = P + R_actual)
 
         # 3. 计算所有模型的 Log-probs
@@ -333,7 +334,7 @@ if __name__ == "__main__":
     # ========== 4. 配wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
-        import swanlab as wandb
+        import wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-PPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
