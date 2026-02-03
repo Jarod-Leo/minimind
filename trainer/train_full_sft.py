@@ -20,64 +20,108 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 warnings.filterwarnings('ignore')
 
 # 【新增】验证逻辑函数
-def validate(model, loader, loss_fct, autocast_ctx, args):
+def validate(
+    model,
+    loader,
+    loss_fct,
+    autocast_ctx,
+    device
+):
     model.eval()
-    total_val_loss = 0
+
+    # 本地统计（Python float，避免 GPU 同步）
+    local_loss_sum = 0.0
+    local_batch_count = 0
+
     with torch.no_grad():
         for X, Y, loss_mask in loader:
-            X = X.to(args.device)
-            Y = Y.to(args.device)
-            loss_mask = loss_mask.to(args.device)
+            X = X.to(device, non_blocking=True)
+            Y = Y.to(device, non_blocking=True)
+            loss_mask = loss_mask.to(device, non_blocking=True)
+
             with autocast_ctx:
-                res = model(X)
+                out = model(X)
                 loss = loss_fct(
-                    res.logits.view(-1, res.logits.size(-1)),
+                    out.logits.view(-1, out.logits.size(-1)),
                     Y.view(-1)
                 ).view(Y.size())
-                loss = (loss * loss_mask).sum() / loss_mask.sum()
-                # 如果是 MoE 架构，累加辅助损失
-                if hasattr(res, 'aux_loss'):
-                    loss += res.aux_loss
-            total_val_loss += loss.item()
-    
-    # DDP模式下聚合所有进程的损失
-    if dist.is_initialized():
-        dist.all_reduce(torch.tensor(total_val_loss).to(args.device), op=dist.ReduceOp.SUM)
-        total_val_loss /= dist.get_world_size()
-        
-    avg_val_loss = total_val_loss / len(loader)
-    model.train()
-    return avg_val_loss
 
-def train_epoch(epoch, train_loader, val_loader, iters, start_step=0, wandb=None):
+                loss = (loss * loss_mask).sum() / loss_mask.sum()
+                if hasattr(out, "aux_loss"):
+                    loss = loss + out.aux_loss
+
+            local_loss_sum += loss.item()
+            local_batch_count += 1
+
+    # ===============================
+    # 🔒 single all-reduce (关键优化点)
+    # ===============================
+    if dist.is_initialized():
+        stats = torch.tensor(
+            [local_loss_sum, local_batch_count],
+            device=device,
+            dtype=torch.float64  # 精度更稳
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+        global_loss = stats[0] / stats[1]
+    else:
+        global_loss = local_loss_sum / max(1, local_batch_count)
+
+    model.train()
+    return global_loss.item()
+
+
+
+def train_epoch(
+    epoch,
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    scaler,
+    autocast_ctx,
+    start_step,
+    iters,
+    args,
+    wandb=None
+):
+    global best_val_loss
+
+    model.train()
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
-    
-    # 【改动】维护当前 epoch 里的最佳验证损失（仅主进程）
-    global best_val_loss 
+    val_total_time = 0.0
 
     for step, (X, Y, loss_mask) in enumerate(train_loader, start=start_step + 1):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
-        
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        global_step = epoch * iters + step
 
+        X = X.to(args.device, non_blocking=True)
+        Y = Y.to(args.device, non_blocking=True)
+        loss_mask = loss_mask.to(args.device, non_blocking=True)
+
+        # ---- LR ----
+        lr = get_lr(global_step, args.epochs * iters, args.learning_rate)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
+
+        # ---- forward ----
         with autocast_ctx:
-            res = model(X)
+            out = model(X)
             loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),
+                out.logits.view(-1, out.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
 
             loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss += res.aux_loss
+            if hasattr(out, "aux_loss"):
+                loss = loss + out.aux_loss
+
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
+        # ---- step ----
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -85,26 +129,61 @@ def train_epoch(epoch, train_loader, val_loader, iters, start_step=0, wandb=None
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        # 【新增】周期性验证逻辑
-        if step % args.eval_interval == 0:
-            val_loss = validate(model, val_loader, loss_fct, autocast_ctx, args)
+        # ============================================================
+        # ✅ DDP-safe VALIDATION（最关键）
+        # ============================================================
+        if (step + 1) % args.eval_interval == 0:
+            val_start = time.time()
+
+            val_loss = validate(
+                model.module if isinstance(model, DistributedDataParallel) else model,
+                val_loader,
+                loss_fct,
+                autocast_ctx,
+                args.device
+            )
+
+            val_time = time.time() - val_start
+            val_total_time += val_time
+
+            # ---- rank0 only side-effects ----
             if is_main_process():
-                Logger(f'>>> Step {step}: Validation Loss: {val_loss:.6f}')
-                if wandb: wandb.log({"val_loss": val_loss}, step=epoch * iters + step)
-                
-                # 【新增】如果 val_loss 创新低，保存 Best 模型
+                Logger(
+                    f">>> Step {step} | "
+                    f"val_loss={val_loss:.6f} | "
+                    f"val_time={val_time:.1f}s"
+                )
+
+                if wandb:
+                    wandb.log(
+                        {
+                            "val_loss": val_loss,
+                            "val_time": val_time,
+                        },
+                        step=epoch * iters + step
+                    )
+
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    ckp_best = f'{args.save_dir}/{args.save_weight}_best.pth'
-                    state_dict = model.module.state_dict() if isinstance(model, DistributedDataParallel) else model.state_dict()
-                    torch.save({k: v.half() for k, v in state_dict.items()}, ckp_best)
-                    Logger(f'*** Best model updated at step {step}, Val Loss: {val_loss:.6f}')
+                    save_path = f"{args.save_dir}/{args.save_weight}_best.pth"
+                    state_dict = (
+                        model.module.state_dict()
+                        if isinstance(model, DistributedDataParallel)
+                        else model.state_dict()
+                    )
+                    torch.save(
+                        {k: v.half() for k, v in state_dict.items()},
+                        save_path
+                    )
 
+        # ============================================================
+        # LOG
+        # ============================================================
         if step % args.log_interval == 0 or step == iters - 1:
-            spend_time = time.time() - start_time
+            actual_train_time = time.time() - start_time - val_total_time
             current_loss = loss.item() * args.accumulation_steps
             current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            eta_min = actual_train_time / (step + 1) * iters // 60 - actual_train_time // 60
             Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:')
             if wandb: wandb.log({"loss": current_loss, "lr": current_lr}, step=epoch * iters + step)
 
@@ -140,7 +219,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument("--data_path", type=str, default="../dataset/sft_mini_512.jsonl", help="训练数据路径")
     # 【新增】验证相关参数
-    parser.add_argument("--eval_interval", type=int, default=500, help="每隔多少step进行一次验证")
+    parser.add_argument("--eval_interval", type=int, default=50000, help="每隔多少step进行一次验证")
     parser.add_argument('--from_weight', default='pretrain', type=str, help="基于哪个权重训练")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否续训")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
@@ -181,7 +260,13 @@ if __name__ == "__main__":
     # 训练集加载
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     # 验证集加载
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=True, drop_last=False)
+    val_sampler = DistributedSampler(
+        val_ds,
+        shuffle=False
+    ) if dist.is_initialized() else None
+
+
+    # val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=True, drop_last=False)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -204,10 +289,16 @@ if __name__ == "__main__":
     # ========== 7. 训练循环 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
+        val_sampler and val_sampler.set_epoch(epoch)
         if epoch == start_epoch and start_step > 0:
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
             loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
-            train_epoch(epoch, loader, val_loader, len(loader) + start_step + 1, start_step, wandb)
+
+            val_batch_sampler = SkipBatchSampler(val_sampler or range(len(val_ds)), args.batch_size, start_step + 1)
+            val_loader = DataLoader(val_ds, batch_sampler=val_batch_sampler, num_workers=args.num_workers, pin_memory=True)
+            
+            train_epoch(epoch, model, loader, val_loader, optimizer, scaler, autocast_ctx, start_step, len(loader) + start_step + 1, args, wandb)
         else:
             loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
-            train_epoch(epoch, loader, val_loader, len(loader), 0, wandb)
+            val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=(val_sampler is None), sampler=val_sampler, num_workers=args.num_workers, pin_memory=True)
+            train_epoch(epoch, model, loader, val_loader, optimizer, scaler, autocast_ctx, 0, len(loader), args, wandb)
