@@ -5,9 +5,10 @@
 #BSUB -q gpu_regular                  # 队列名
 #BSUB -W 72:00                        # 时间限制建议增加（SFT+PPO的总时间）
 #BSUB -n 32                           # 申请 32 个 CPU 核心
-#BSUB -gpu "num=8:mode=exclusive_process:j_exclusive=yes" # 申请 8 张 GPU
+#BSUB -gpu "num=6:mode=exclusive_process:j_exclusive=yes" # 申请 8 张 GPU
 #BSUB -M 8192                         # 内存设置
 #BSUB -R "span[hosts=1]"
+#BSUB -m "szh-hpc-b02gp05"
 # --- 1. 环境准备 ---
 module load conda/4.11.0 
 source activate minimind 
@@ -24,13 +25,13 @@ export MASTER_PORT=$(shuf -i 10000-60000 -n 1)
 # --- 2. 运行 SFT 任务 ---
 echo ">>> Step 1: Starting Supervised Fine-Tuning (SFT)..."
 torchrun \
-    --nproc_per_node=8 \
+    --nproc_per_node=6 \
     --master_addr $MASTER_ADDR \
     --master_port $MASTER_PORT \
     train_full_sft.py \
-    --batch_size 4 \
-    --accumulation_steps 4 \
-    --num_workers 4 \
+    --batch_size 32 \
+    --accumulation_steps 1 \
+    --num_workers 2 \
     --hidden_size 768 \
     --num_hidden_layers 16 \
     --max_seq_len 2048 \
@@ -55,9 +56,9 @@ if [ $sft_status -eq 0 ]; then
         --master_addr $MASTER_ADDR \
         --master_port $MASTER_PORT \
         train_full_sft.py \
-        --batch_size 4 \
+        --batch_size 8 \
         --accumulation_steps 1 \
-        --num_workers 4 \
+        --num_workers 2 \
         --hidden_size 768 \
         --num_hidden_layers 16 \
         --reasoning 0 \
