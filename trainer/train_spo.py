@@ -281,7 +281,7 @@ if __name__ == "__main__":
     # ========== 4. 配wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
-        import swanlab as wandb
+        import wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-SPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
