@@ -1,14 +1,14 @@
 #!/bin/bash
-#BSUB -J sft_minimind          # 任务名
-#BSUB -o ../logs/sft.%J.out     # 标准输出 (需确保 logs 文件夹存在)
-#BSUB -e ../logs/sft.%J.err     # 错误输出
+#BSUB -J ppo_minimind          # 任务名
+#BSUB -o ../logs/ppo.%J.out     # 标准输出 (需确保 logs 文件夹存在)
+#BSUB -e ../logs/ppo.%J.err     # 错误输出
 #BSUB -q gpu_regular              # 队列名
 #BSUB -W 48:00                    # 运行时间限制
-#BSUB -n 32                        # 【修改建议】申请 24 个 CPU 核心 (通常 1 个 GPU 配 4 个 CPU 核心数据加载更快)
-#BSUB -gpu "num=8:mode=exclusive_process:j_exclusive=yes" # 申请 4 张 GPU，独占模式
+#BSUB -n 24                        # 【修改建议】申请 24 个 CPU 核心 (通常 1 个 GPU 配 4 个 CPU 核心数据加载更快)
+#BSUB -gpu "num=6:mode=exclusive_process:j_exclusive=yes" # 申请 4 张 GPU，独占模式
 #BSUB -M 8192       # 【修改建议】申请 32G 内存 (16G 对于双卡 Transformer 可能容易 OOM)
 #BSUB -R "span[hosts=1]"          # 【关键修正】强制所有资源分配在同一个节点 (单机多卡)
-
+#BSUB -m "szh-hpc-b02gp05"
 
 # --- 1. 环境准备 ---
 # 加载集群的基础 conda 模块 (参考你的示例)
@@ -43,16 +43,15 @@ echo "Master Port: $MASTER_PORT"
 # 使用 python -m torch.distributed.launch 启动分布式训练
 echo "--- Starting Task: PPO Train ---"
 torchrun \
-    --nproc_per_node=8 \
+    --nproc_per_node=6 \
     --master_addr $MASTER_ADDR \
     --master_port $MASTER_PORT \
-    train_full_sft.py \
+    train_ppo.py \
     --batch_size 4 \
     --accumulation_steps 1 \
-    --num_workers 4 \
+    --num_workers 16 \
     --hidden_size 768 \
     --num_hidden_layers 16 \
     --reasoning 0 \
-    --data_path  ../dataset/sft_2048.jsonl \
     --use_wandb 
       
